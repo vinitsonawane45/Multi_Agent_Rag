@@ -4,7 +4,7 @@ A production-ready multi-agent retrieval-augmented generation (RAG) system built
 
 ---
 
-## ✨ Features
+## ✨ Feature
 
 - **Multi-agent pipeline** — Supervisor orchestrates Retriever → Coder → Critic → Memory agents via LangGraph
 - **Hybrid RAG** — Dense vector search (Qdrant + sentence-transformers) with BM25 sparse retrieval
