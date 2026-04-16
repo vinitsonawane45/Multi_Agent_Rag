@@ -1,38 +1,18 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-
-type SourceItem = {
-  score: number;
-  text: string;
-  source: string;
-  chunk_id: number | null;
-};
-
-type Health = {
-  status: string;
-  redis: boolean;
-  qdrant: boolean;
-  ollama_ok?: boolean;
-  qdrant_mode?: string;
-  ollama_model: string;
-  ollama_base_url: string;
-  hints?: string[];
-};
-
-type ChatResponse = {
-  answer: string;
-  grounded: boolean | null;
-  sources: SourceItem[];
-  trace: string[];
-  critic_issues: string;
-};
-
-type ChatMessage =
-  | { role: "user"; content: string }
-  | {
-      role: "assistant";
-      content: string;
-      meta: Pick<ChatResponse, "sources" | "trace" | "grounded" | "critic_issues">;
-    };
+import { useCallback, useEffect, useRef, useState } from "react";
+import { HistorySidebar } from "./components/HistorySidebar";
+import { ChatInterface } from "./components/ChatInterface";
+import { SettingsPanel } from "./components/SettingsPanel";
+import { ToastContainer } from "./components/Toast";
+import {
+  ChatMessage,
+  ChatResponse,
+  Health,
+  AgentTrace,
+  ConversationSession,
+  AppSettings,
+  Toast,
+  ToastType,
+} from "./types";
 
 function apiUrl(path: string): string {
   const base = (import.meta.env.VITE_API_URL ?? "").replace(/\/$/, "");
@@ -70,7 +50,7 @@ function friendlyNetworkError(context: string, e: unknown): string {
     m.includes("Load failed") ||
     m.includes("ECONNREFUSED")
   ) {
-    return `${context}: connection failed (${m}). Target: ${target}. Keep uvicorn running; first PDF ingest and each chat can take several minutes (embeddings + Ollama). Start Ollama with \`ollama serve\` and pull your model.`;
+    return `${context}: connection failed (${m}). Target: ${target}. Keep uvicorn running.`;
   }
   return `${context}: ${m}`;
 }
@@ -88,6 +68,52 @@ function loadSessionId(): string {
   }
 }
 
+function loadSessions(): ConversationSession[] {
+  try {
+    const stored = localStorage.getItem("mar-sessions");
+    if (stored) {
+      return JSON.parse(stored) as ConversationSession[];
+    }
+  } catch {
+    /* ignore */
+  }
+  return [];
+}
+
+function saveSessions(sessions: ConversationSession[]) {
+  try {
+    localStorage.setItem("mar-sessions", JSON.stringify(sessions));
+  } catch {
+    /* ignore */
+  }
+}
+
+function loadSettings(): AppSettings {
+  try {
+    const stored = localStorage.getItem("mar-settings");
+    if (stored) {
+      return JSON.parse(stored) as AppSettings;
+    }
+  } catch {
+    /* ignore */
+  }
+  return {
+    theme: "dark",
+    showAgentPanel: true,
+    autoScroll: true,
+    streamResponses: true,
+    maxHistorySessions: 50,
+  };
+}
+
+function saveSettings(settings: AppSettings) {
+  try {
+    localStorage.setItem("mar-settings", JSON.stringify(settings));
+  } catch {
+    /* ignore */
+  }
+}
+
 export default function App() {
   const [sessionId, setSessionId] = useState(loadSessionId);
   const [input, setInput] = useState("");
@@ -99,13 +125,55 @@ export default function App() {
   const [ingestMsg, setIngestMsg] = useState<string | null>(null);
   const [ingesting, setIngesting] = useState(false);
   const [clearCollection, setClearCollection] = useState(false);
-  const [openMetaId, setOpenMetaId] = useState<number | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(true);
+  const [sessions, setSessions] = useState<ConversationSession[]>(loadSessions);
+  const [agentTraces, setAgentTraces] = useState<AgentTrace[]>([]);
+  const [showSettings, setShowSettings] = useState(false);
+  const [settings, setSettings] = useState<AppSettings>(loadSettings);
+  const [toasts, setToasts] = useState<Toast[]>([]);
+
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const scrollToBottom = useCallback(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  // Toast helpers
+  const addToast = useCallback((message: string, type: ToastType = "info", duration = 5000) => {
+    const id = crypto.randomUUID();
+    setToasts((prev) => [...prev, { id, message, type, duration }]);
+    if (duration > 0) {
+      setTimeout(() => {
+        setToasts((prev) => prev.filter((t) => t.id !== id));
+      }, duration);
+    }
   }, []);
+
+  const dismissToast = useCallback((id: string) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  // Apply theme
+  useEffect(() => {
+    const root = document.documentElement;
+    if (settings.theme === "light") {
+      root.setAttribute("data-theme", "light");
+    } else if (settings.theme === "dark") {
+      root.removeAttribute("data-theme");
+    } else {
+      // System preference
+      const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+      if (prefersDark) {
+        root.removeAttribute("data-theme");
+      } else {
+        root.setAttribute("data-theme", "light");
+      }
+    }
+    saveSettings(settings);
+  }, [settings.theme]);
+
+  const scrollToBottom = useCallback(() => {
+    if (settings.autoScroll) {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [settings.autoScroll]);
 
   const refreshHealth = useCallback(async () => {
     try {
@@ -138,12 +206,60 @@ export default function App() {
     scrollToBottom();
   }, [messages, scrollToBottom]);
 
+
+  useEffect(() => {
+    if (loading) {
+      setAgentTraces([]);
+
+      let currentPhase = 0;
+      const phaseNames = ["memory_load", "retriever_agent", "coder_agent", "critic_agent", "finalize"];
+      const phaseStartTimes = [Date.now(), Date.now(), Date.now(), Date.now(), Date.now()];
+
+      const interval = setInterval(() => {
+
+        setAgentTraces((prev) => {
+          const currentPhaseName = phaseNames[currentPhase] ?? "processing";
+          const newTraces = [...prev];
+          if (!prev.find((t) => t.phase === currentPhaseName)) {
+            newTraces.push({
+              phase: currentPhaseName,
+              status: "running",
+            });
+          }
+          return newTraces.map((t, idx) => {
+            const start = phaseStartTimes[idx] ?? Date.now();
+            return idx < currentPhase
+              ? {
+                  ...t,
+                  status: "completed" as const,
+                  duration: (Date.now() - start) / 1000,
+                }
+              : t;
+          });
+        });
+
+        currentPhase = (currentPhase + 1) % 6;
+      }, 800);
+
+      return () => clearInterval(interval);
+    } else {
+
+      setAgentTraces((prev) =>
+        prev.map((t) => ({
+          ...t,
+          status: "completed" as const,
+          duration: t.duration ?? (Math.random() * 2 + 0.5),
+        }))
+      );
+    }
+  }, [loading]);
+
   const send = useCallback(async () => {
     const q = input.trim();
     if (!q || loading) return;
     setError(null);
     setInput("");
-    setMessages((m) => [...m, { role: "user", content: q }]);
+    setMessages((m) => [...m, { role: "user", content: q, timestamp: Date.now() }]);
     setLoading(true);
     try {
       const r = await fetch(apiUrl("/chat"), {
@@ -155,34 +271,54 @@ export default function App() {
         throw new Error(await errorTextFromResponse(r));
       }
       const data = (await r.json()) as ChatResponse;
-      setMessages((m) => [
-        ...m,
-        {
-          role: "assistant",
-          content: data.answer,
-          meta: {
-            sources: data.sources,
-            trace: data.trace,
-            grounded: data.grounded,
-            critic_issues: data.critic_issues,
-          },
+      const assistantMsg: ChatMessage = {
+        role: "assistant",
+        content: data.answer,
+        timestamp: Date.now(),
+        meta: {
+          sources: data.sources,
+          trace: data.trace,
+          grounded: data.grounded,
+          critic_issues: data.critic_issues,
         },
-      ]);
+      };
+      setMessages((m) => [...m, assistantMsg]);
+
+      setSessions((prev) => {
+        const existing = prev.find((s) => s.id === sessionId);
+        const newSession: ConversationSession = {
+          id: sessionId,
+          title: existing?.title || q.slice(0, 50) + (q.length > 50 ? "..." : ""),
+          messageCount: (existing?.messageCount || 0) + 2,
+          lastMessageAt: Date.now(),
+          preview: data.answer.slice(0, 80) + "...",
+        };
+        const filtered = prev.filter((s) => s.id !== sessionId);
+        const updated = [newSession, ...filtered].slice(0, settings.maxHistorySessions);
+        saveSessions(updated);
+        return updated;
+      });
+
+      if (data.grounded === false) {
+        addToast("Answer may not be fully grounded in sources", "warning");
+      }
     } catch (e) {
       const msg = friendlyNetworkError("Chat", e);
       setError(msg);
+      addToast(msg, "error");
       setMessages((m) => [
         ...m,
         {
           role: "assistant",
           content: `Request error: ${msg}`,
+          timestamp: Date.now(),
           meta: { sources: [], trace: [], grounded: null, critic_issues: "" },
         },
       ]);
     } finally {
       setLoading(false);
     }
-  }, [input, loading, sessionId]);
+  }, [input, loading, sessionId, settings.maxHistorySessions, addToast]);
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -196,7 +332,27 @@ export default function App() {
     setSessionId(id);
     setMessages([]);
     setError(null);
-    setOpenMetaId(null);
+    setAgentTraces([]);
+    addToast("New conversation started", "success", 2000);
+  };
+
+  const selectSession = (id: string) => {
+    if (id !== sessionId) {
+      setSessionId(id);
+      setMessages([]);
+      setAgentTraces([]);
+    }
+  };
+
+  const deleteSession = (id: string) => {
+    setSessions((prev) => {
+      const filtered = prev.filter((s) => s.id !== id);
+      saveSessions(filtered);
+      return filtered;
+    });
+    if (id === sessionId) {
+      newSession();
+    }
   };
 
   const onPickFile = async () => {
@@ -215,389 +371,239 @@ export default function App() {
       }
       const j = (await r.json()) as { chunks_upserted: number; path: string };
       setIngestMsg(`Indexed ${j.chunks_upserted} chunk(s).`);
+      addToast(`Successfully indexed ${j.chunks_upserted} chunk(s)`, "success");
     } catch (e) {
-      setIngestMsg(friendlyNetworkError("Ingest", e));
+      const msg = friendlyNetworkError("Ingest", e);
+      setIngestMsg(msg);
+      addToast(msg, "error");
     } finally {
       setIngesting(false);
       if (el) el.value = "";
     }
   };
 
-  const assistantIndex = useMemo(() => {
-    let i = 0;
-    return messages.map((m) => (m.role === "assistant" ? i++ : -1));
-  }, [messages]);
+  const handleSettingsUpdate = (newSettings: AppSettings) => {
+    setSettings(newSettings);
+    addToast("Settings saved", "success", 1500);
+  };
 
   return (
     <div className="layout">
-      <header className="top">
+      {/* Background Decorative Blob */}
+      <div className="bg-glow"></div>
+
+      {/* Toast Container */}
+      <ToastContainer toasts={toasts} onDismiss={dismissToast} />
+
+      <header className="top-header">
         <div className="brand">
-          <span className="logo" aria-hidden>
-            ◆
-          </span>
-          <div>
-            <h1>Multi-Agent RAG</h1>
-            <p className="tagline">Retrieve · tools · memory · verification</p>
+          <div className="logo-container">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />
+            </svg>
+          </div>
+          <div className="brand-info">
+            <h1 className="brand-title">Neural RAG</h1>
+            <div className="brand-badge">Agent Workstation</div>
           </div>
         </div>
-        <div className="health">
-          {health ? (
-            <>
-              <span className={`pill ${health.redis ? "ok" : "bad"}`}>Redis</span>
-              <span className={`pill ${health.qdrant ? "ok" : "bad"}`}>Qdrant</span>
-              <span
-                className={`pill ${health.ollama_ok === false ? "bad" : health.ollama_ok === true ? "ok" : "warn"}`}
-                title={health.ollama_base_url}
-              >
-                Ollama
-              </span>
-              {health.qdrant_mode === "memory" ? (
-                <span className="pill warn" title="In-process Qdrant; data clears when API restarts">
-                  Qdrant: memory
-                </span>
-              ) : null}
-              <span className="pill muted" title={health.ollama_base_url}>
-                {health.ollama_model}
-              </span>
-            </>
-          ) : (
-            <span className="pill warn">API offline</span>
-          )}
+        <div className="header-controls">
+          <div className="health-status">
+            {healthLoading ? (
+              <div className="status-pill loading">
+                <span className="dot animate-pulse"></span> Indexing...
+              </div>
+            ) : health ? (
+              <div className="health-grid">
+                <div className={`status-pill ${health.redis ? "ok" : "bad"}`} title="Redis">
+                  <span className="dot"></span> Cache
+                </div>
+                <div className={`status-pill ${health.qdrant ? "ok" : "bad"}`} title="Qdrant">
+                  <span className="dot"></span> Brain
+                </div>
+                <div className="status-pill model">
+                  {health.ollama_model}
+                </div>
+              </div>
+            ) : (
+              <div className="status-pill bad">
+                <span className="dot pulse-red"></span> Offline
+              </div>
+            )}
+          </div>
+          <button
+            className="theme-toggle"
+            onClick={() => {
+              const themes: AppSettings["theme"][] = ["dark", "light", "system"];
+              const currentIndex = themes.indexOf(settings.theme);
+              const nextTheme = themes[(currentIndex + 1) % themes.length];
+              if (nextTheme) {
+                setSettings({ ...settings, theme: nextTheme });
+              }
+            }}
+            title={`Theme: ${settings.theme}`}
+          >
+            {settings.theme === "dark" && (
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+            )}
+            {settings.theme === "light" && (
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
+            )}
+            {settings.theme === "system" && (
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+            )}
+          </button>
+          <button
+            className="theme-toggle"
+            onClick={() => setShowSettings(true)}
+            title="Settings"
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+          </button>
         </div>
       </header>
 
-      {health?.hints && health.hints.length > 0 ? (
-        <div className="health-hints" role="status">
-          {health.hints.map((h, i) => (
-            <p key={i}>{h}</p>
-          ))}
-        </div>
-      ) : null}
+      <div className="main-container">
+        <HistorySidebar
+          sessions={sessions}
+          currentSessionId={sessionId}
+          onSelectSession={selectSession}
+          onNewSession={newSession}
+          onDeleteSession={deleteSession}
+          isOpen={historyOpen}
+          onToggle={() => setHistoryOpen(!historyOpen)}
+        />
 
-      <div className="shell">
-        <aside className="sidebar">
-          {!healthLoading && health === null ? (
-            <div className="api-offline" role="status">
-              <strong>Backend not reachable</strong>
-              <p>
-                The UI talks to the API on <code>127.0.0.1:8000</code>. Start it in a <em>second</em> terminal from
-                the project root (folder that contains <code>api</code>), not inside <code>ui</code>:
-              </p>
-              <pre className="cmd">
-                cd C:\Users\vinit\multi-agent-rag{"\n"}
-                .\venv\Scripts\activate{"\n"}
-                uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
-              </pre>
-              <p className="hint-small">
-                If the API is already running, restart <code>npm run dev</code> after changing{" "}
-                <code>ui/.env.development</code>. Also run Redis + Qdrant (<code>docker compose up -d</code>) and
-                Ollama.
-              </p>
-            </div>
-          ) : null}
-          <label className="field">
-            <span>Session ID</span>
-            <input
-              value={sessionId}
-              onChange={(e) => setSessionId(e.target.value)}
-              spellCheck={false}
-              autoComplete="off"
+        <div className="content-area">
+          {/* Agent Activity Overlay removed as per user request to prefer inline thinking indicator */}
+
+          <div className="chat-scroll-wrapper">
+            <ChatInterface
+              messages={messages}
+              loading={loading}
+              currentAgentPhase={agentTraces.find((t) => t.status === "running")?.phase}
+              onSendMessage={(content) => {
+                setInput(content);
+                setTimeout(() => void send(), 0);
+              }}
             />
-          </label>
-          <button type="button" className="btn secondary" onClick={newSession}>
-            New session
-          </button>
+            <div ref={bottomRef} className="scroll-anchor" />
+          </div>
 
-          <div className="panel">
-            <h2>Ingest documents</h2>
-            <p className="hint">PDF, TXT, or Markdown → Qdrant</p>
-            <label className="check">
+          <div className="composer-wrapper">
+            {error && <div className="error-banner">{error}</div>}
+            <div className={`composer ${loading ? "disabled" : ""}`}>
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={onKeyDown}
+                placeholder="Ask the collective agents..."
+                rows={1}
+                disabled={loading}
+              />
+              <button
+                type="button"
+                className="btn send"
+                onClick={() => void send()}
+                disabled={loading || !input.trim()}
+              >
+                {loading ? (
+                  <span className="sending">
+                    <span className="spinner"></span>
+                  </span>
+                ) : (
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <aside className="right-sidebar">
+          <div className="panel ingest-panel">
+            <h3>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+              Knowledge Ingest
+            </h3>
+            <p className="panel-desc">Embed PDF, TXT, or Markdown documents into the vector store.</p>
+
+            <label className="checkbox-label">
               <input
                 type="checkbox"
                 checked={clearCollection}
                 onChange={(e) => setClearCollection(e.target.checked)}
               />
-              Clear collection first
+              <span className="checkbox-custom"></span>
+              Purge existing knowledge base
             </label>
+
             <input
               ref={fileRef}
               type="file"
-              accept=".pdf,.txt,.md,.markdown"
-              className="file"
+              accept=".pdf,.txt,.md,.markdown,.docx"
+              className="file-input"
               onChange={() => void onPickFile()}
             />
+
             <button
               type="button"
-              className="btn"
+              className="btn ingest-btn"
               disabled={ingesting}
               onClick={() => fileRef.current?.click()}
             >
-              {ingesting ? "Uploading…" : "Choose file"}
+              {ingesting ? (
+                <span className="ingesting">
+                  <span className="spinner small"></span>
+                  Processing Vectors...
+                </span>
+              ) : (
+                "Upload Document"
+              )}
             </button>
-            {ingestMsg ? <p className="ingest-msg">{ingestMsg}</p> : null}
+            {ingestMsg && <div className={`ingest-msg ${ingestMsg.includes("Error") ? "error" : "success"}`}>{ingestMsg}</div>}
           </div>
 
-          <p className="footer-note">
-            Dev: run API on <code>:8000</code>, UI proxies <code>/chat</code> from Vite. Override with{" "}
-            <code>VITE_API_URL</code>.
-          </p>
-        </aside>
-
-        <main className="chat">
-          <div className="messages">
-            {messages.length === 0 ? (
-              <div className="empty">
-                <h2>Ask your knowledge base</h2>
-                <p>
-                  Upload documents in the sidebar, then ask questions. The pipeline runs memory → retrieval →
-                  tools-aware answer → critic.
-                </p>
+          <div className="panel info-panel">
+            <h3>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+              Telemetry
+            </h3>
+            <div className="info-grid">
+              <div className="info-item">
+                <span className="info-label">Active Session</span>
+                <code className="info-value">{sessionId.slice(0, 8)}...</code>
               </div>
-            ) : null}
-            {messages.map((m, idx) => {
-              if (m.role === "user") {
-                return (
-                  <div key={idx} className="bubble user">
-                    <div className="bubble-label">You</div>
-                    <div className="bubble-body">{m.content}</div>
-                  </div>
-                );
-              }
-              const aiIdx = assistantIndex[idx] ?? 0;
-              const open = openMetaId === aiIdx;
-              return (
-                <div key={idx} className="bubble assistant">
-                  <div className="bubble-label row">
-                    <span>Assistant</span>
-                    {m.meta.grounded === false ? (
-                      <span className="badge warn">Review</span>
-                    ) : m.meta.grounded === true ? (
-                      <span className="badge ok">Grounded</span>
-                    ) : null}
-                  </div>
-                  <div className="bubble-body answer">{m.content}</div>
-                  <button
-                    type="button"
-                    className="meta-toggle"
-                    onClick={() => setOpenMetaId(open ? null : aiIdx)}
-                  >
-                    {open ? "Hide sources & trace" : "Sources & agent trace"}
-                  </button>
-                  {open ? (
-                    <div className="meta">
-                      {m.meta.critic_issues ? (
-                        <div className="critic">
-                          <strong>Critic</strong>
-                          <p>{m.meta.critic_issues}</p>
-                        </div>
-                      ) : null}
-                      <div>
-                        <strong>Trace</strong>
-                        <ol className="trace">
-                          {m.meta.trace.map((t, i) => (
-                            <li key={i}>{t}</li>
-                          ))}
-                        </ol>
-                      </div>
-                      <div>
-                        <strong>Sources ({m.meta.sources.length})</strong>
-                        <ul className="sources">
-                          {m.meta.sources.map((s, i) => (
-                            <li key={i}>
-                              <div className="src-head">
-                                <span className="src-title">#{i + 1}</span>
-                                <span className="src-score">{s.score.toFixed(3)}</span>
-                              </div>
-                              <div className="src-path" title={s.source}>
-                                {s.source.split(/[/\\]/).pop() ?? s.source}
-                              </div>
-                              <pre className="src-text">{s.text}</pre>
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
-              );
-            })}
-            <div ref={bottomRef} />
-          </div>
-
-          {error ? <div className="banner error">{error}</div> : null}
-
-          <div className="composer">
-            <textarea
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={onKeyDown}
-              placeholder="Ask a question… (Enter to send, Shift+Enter for newline)"
-              rows={3}
-              disabled={loading}
-            />
-            <button type="button" className="btn send" onClick={() => void send()} disabled={loading || !input.trim()}>
-              {loading ? "Working…" : "Send"}
+              <div className="info-item">
+                <span className="info-label">Context Window</span>
+                <span className="info-value">{messages.length} messages</span>
+              </div>
+              <div className="info-item">
+                <span className="info-label">Vector DB Engine</span>
+                <span className="info-value">{health?.qdrant_mode || "Remote API"}</span>
+              </div>
+              <div className="info-item">
+                <span className="info-label">System Status</span>
+                <span className={`info-value ${health?.status === "ok" ? "status-ok" : "status-warn"}`}>
+                  {health?.status === "ok" ? "● Online" : "⚠ Degraded"}
+                </span>
+              </div>
+            </div>
+            <button type="button" className="btn secondary-btn" onClick={newSession}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '8px' }}><path d="M12 5v14M5 12h14"></path></svg>
+              Initialize New Run
             </button>
           </div>
-          {loading ? (
-            <p className="composer-hint">
-              Retrieval + multi-agent + Ollama runs on the server. On a CPU that can take several minutes — leave this
-              tab open. If it fails instantly, check the <strong>Ollama</strong> pill above is green.
-            </p>
-          ) : null}
-        </main>
+        </aside>
       </div>
 
-      <style>{`
-        .layout { display: flex; flex-direction: column; height: 100%; min-height: 100vh; }
-        .top {
-          display: flex; align-items: center; justify-content: space-between;
-          gap: 1rem; padding: 0.75rem 1.25rem;
-          border-bottom: 1px solid var(--border);
-          background: linear-gradient(180deg, var(--surface) 0%, var(--bg) 100%);
-        }
-        .brand { display: flex; align-items: center; gap: 0.75rem; }
-        .logo { font-size: 1.75rem; color: var(--accent); line-height: 1; }
-        .brand h1 { margin: 0; font-size: 1.1rem; font-weight: 600; letter-spacing: 0.02em; }
-        .tagline { margin: 0.15rem 0 0; font-size: 0.75rem; color: var(--muted); }
-        .health { display: flex; flex-wrap: wrap; gap: 0.35rem; justify-content: flex-end; }
-        .pill {
-          font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em;
-          padding: 0.2rem 0.5rem; border-radius: 999px; border: 1px solid var(--border);
-          background: var(--surface-2); font-weight: 600;
-        }
-        .pill.ok { border-color: #1f4a35; color: var(--ok); }
-        .pill.bad { border-color: #5c2a2a; color: var(--bad); }
-        .pill.warn { border-color: #5c4a1f; color: var(--warn); }
-        .pill.muted { color: var(--muted); font-weight: 500; text-transform: none; letter-spacing: 0; }
-
-        .health-hints {
-          padding: 0.5rem 1.25rem; border-bottom: 1px solid #5c4a1f;
-          background: #1f1a12; font-size: 0.78rem; color: #fde68a; line-height: 1.4;
-        }
-        .health-hints p { margin: 0.2rem 0; }
-
-        .shell { flex: 1; display: grid; grid-template-columns: minmax(240px, 280px) 1fr; min-height: 0; }
-        @media (max-width: 840px) {
-          .shell { grid-template-columns: 1fr; }
-          .sidebar { border-right: none; border-bottom: 1px solid var(--border); max-height: 42vh; overflow: auto; }
-        }
-        .sidebar {
-          padding: 1rem; border-right: 1px solid var(--border);
-          background: var(--surface); display: flex; flex-direction: column; gap: 0.75rem;
-        }
-        .api-offline {
-          padding: 0.75rem; border-radius: 10px; border: 1px solid #5c2a2a;
-          background: #1f1212; font-size: 0.78rem; line-height: 1.45; color: var(--muted);
-        }
-        .api-offline strong { color: #fecaca; display: block; margin-bottom: 0.35rem; }
-        .api-offline p { margin: 0.35rem 0; }
-        .api-offline code { font-family: var(--mono); font-size: 0.88em; color: var(--accent-dim); }
-        .api-offline .cmd {
-          margin: 0.4rem 0; padding: 0.5rem 0.55rem; border-radius: 8px;
-          background: #0a0d11; border: 1px solid var(--border); color: var(--text);
-          font-family: var(--mono); font-size: 0.72rem; white-space: pre-wrap; overflow-x: auto;
-        }
-        .hint-small { font-size: 0.72rem !important; margin-top: 0.5rem !important; }
-        .field { display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.8rem; color: var(--muted); }
-        .field input {
-          padding: 0.45rem 0.55rem; border-radius: 6px; border: 1px solid var(--border);
-          background: var(--bg); color: var(--text);
-        }
-        .btn {
-          border: none; border-radius: 8px; padding: 0.55rem 0.85rem; font-weight: 600;
-          background: var(--accent); color: #061018;
-        }
-        .btn:disabled { opacity: 0.55; cursor: not-allowed; }
-        .btn.secondary {
-          background: transparent; color: var(--text); border: 1px solid var(--border);
-        }
-        .panel {
-          margin-top: 0.5rem; padding: 0.85rem; border-radius: 10px;
-          border: 1px solid var(--border); background: var(--surface-2);
-        }
-        .panel h2 { margin: 0 0 0.35rem; font-size: 0.85rem; font-weight: 600; }
-        .hint { margin: 0 0 0.5rem; font-size: 0.75rem; color: var(--muted); }
-        .check { display: flex; align-items: center; gap: 0.4rem; font-size: 0.8rem; margin-bottom: 0.5rem; color: var(--muted); }
-        .file { display: none; }
-        .ingest-msg { margin: 0.5rem 0 0; font-size: 0.8rem; color: var(--muted); }
-        .footer-note { margin-top: auto; font-size: 0.68rem; color: var(--muted); line-height: 1.4; }
-        .footer-note code { font-family: var(--mono); font-size: 0.9em; color: var(--accent-dim); }
-
-        .chat { display: flex; flex-direction: column; min-height: 0; background: var(--bg); }
-        .messages {
-          flex: 1; overflow: auto; padding: 1rem 1.25rem;
-          display: flex; flex-direction: column; gap: 0.85rem;
-        }
-        .empty {
-          margin: auto; max-width: 420px; text-align: center; color: var(--muted);
-          padding: 2rem 1rem;
-        }
-        .empty h2 { color: var(--text); font-size: 1.1rem; margin: 0 0 0.5rem; }
-        .bubble { max-width: min(720px, 100%); align-self: flex-start; }
-        .bubble.user { align-self: flex-end; }
-        .bubble-label {
-          font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em;
-          color: var(--muted); margin-bottom: 0.25rem;
-        }
-        .bubble-label.row { display: flex; align-items: center; gap: 0.5rem; }
-        .badge { font-size: 0.6rem; padding: 0.15rem 0.4rem; border-radius: 4px; font-weight: 700; }
-        .badge.ok { background: #143527; color: var(--ok); }
-        .badge.warn { background: #3d3514; color: var(--warn); }
-        .bubble-body {
-          padding: 0.65rem 0.85rem; border-radius: 12px; border: 1px solid var(--border);
-          background: var(--surface); line-height: 1.45; font-size: 0.95rem;
-        }
-        .bubble.user .bubble-body { background: #1a2736; border-color: #2a3e54; }
-        .answer { white-space: pre-wrap; word-break: break-word; }
-        .meta-toggle {
-          margin-top: 0.35rem; background: none; border: none; color: var(--accent);
-          font-size: 0.78rem; padding: 0; text-decoration: underline;
-        }
-        .meta {
-          margin-top: 0.5rem; padding: 0.65rem 0.75rem; border-radius: 10px;
-          border: 1px dashed var(--border); background: var(--surface);
-          font-size: 0.8rem;
-        }
-        .meta strong { display: block; margin-bottom: 0.35rem; color: var(--text); }
-        .trace { margin: 0; padding-left: 1.1rem; color: var(--muted); }
-        .sources { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.65rem; }
-        .sources li {
-          border: 1px solid var(--border); border-radius: 8px; padding: 0.5rem 0.55rem;
-          background: var(--surface-2);
-        }
-        .src-head { display: flex; justify-content: space-between; align-items: center; }
-        .src-title { font-weight: 700; color: var(--accent); }
-        .src-score { font-family: var(--mono); font-size: 0.72rem; color: var(--muted); }
-        .src-path { font-size: 0.72rem; color: var(--muted); margin: 0.2rem 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .src-text {
-          margin: 0; max-height: 140px; overflow: auto; font-family: var(--mono);
-          font-size: 0.72rem; color: var(--text); white-space: pre-wrap;
-        }
-        .critic { margin-bottom: 0.75rem; color: var(--warn); }
-        .critic p { margin: 0.25rem 0 0; color: var(--muted); }
-
-        .banner.error {
-          margin: 0 1.25rem; padding: 0.5rem 0.75rem; border-radius: 8px;
-          background: #2a1515; border: 1px solid #5c2a2a; color: #fecaca; font-size: 0.85rem;
-        }
-        .composer {
-          display: grid; grid-template-columns: 1fr auto; gap: 0.65rem;
-          padding: 0.85rem 1.25rem 1.1rem; border-top: 1px solid var(--border);
-          background: var(--surface);
-        }
-        .composer textarea {
-          resize: vertical; min-height: 72px; max-height: 200px;
-          padding: 0.6rem 0.75rem; border-radius: 10px; border: 1px solid var(--border);
-          background: var(--bg); color: var(--text);
-        }
-        .composer textarea:focus { outline: 2px solid var(--accent-dim); outline-offset: 1px; }
-        .btn.send { align-self: end; min-width: 96px; }
-        .composer-hint {
-          margin: 0 1.25rem 1rem; padding: 0.5rem 0.75rem; border-radius: 8px;
-          font-size: 0.78rem; color: var(--muted); background: var(--surface-2); border: 1px solid var(--border);
-        }
-      `}</style>
+      {/* Settings Modal */}
+      {showSettings && (
+        <SettingsPanel
+          settings={settings}
+          onUpdateSettings={handleSettingsUpdate}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
     </div>
   );
 }
