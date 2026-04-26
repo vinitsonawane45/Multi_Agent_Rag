@@ -31,10 +31,12 @@ class Settings(BaseSettings):
     redis_port: int = 6379
     redis_db: int = 0
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    sparse_embedding_model: str = "prithivida/Splade_PP_en_v1"
     chunk_size: int = 512
     chunk_overlap: int = 64
     retrieval_top_k: int = 6
     session_history_max_messages: int = 24
+    max_retries: int = 2
     # Comma-separated origins for browser UI (dev/preview). Empty disables CORS middleware.
     # Include 5174+ — Vite picks the next free port when 5173 is taken.
     cors_origins: str = (

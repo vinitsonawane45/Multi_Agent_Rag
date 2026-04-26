@@ -94,11 +94,16 @@ def make_critic_node(settings: Settings) -> Callable[[MultiAgentState], MultiAge
         grounded = bool(data.get("grounded", True))
         issues = str(data.get("issues", "") or "")
         revised = str(data.get("revised_answer", "") or "").strip() or draft
+        
+        feedback_list = state.get("critic_feedback") or []
+        if not grounded and issues:
+            feedback_list = feedback_list + [issues]
 
         return {
             "critic_grounded": grounded,
             "critic_issues": issues,
             "revised_answer": revised,
+            "critic_feedback": feedback_list,
             "trace": trace,
         }
 

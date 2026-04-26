@@ -21,16 +21,18 @@ from core.llm import get_llm_with_fallback, get_ollama_llm, is_timeout_or_connec
 logger = logging.getLogger(__name__)
 
 
-def _build_messages(query: str, history: str, context: str):
-    sys = SystemMessage(
-        content=(
-            "You are the research assistant for an enterprise knowledge base.\n"
-            "Use SOURCE_SNIPPETS as the primary evidence. If the user needs arithmetic, "
-            "call calculator. For fixed internal KPIs not in the snippets, call internal_metric_lookup.\n"
-            "Cite which source index (Source 1, 2, …) supports key claims when possible.\n"
-            "If sources are empty or irrelevant, say so and rely on tools or careful reasoning."
-        )
+def _build_messages(query: str, history: str, context: str, feedback: str = ""):
+    sys_content = (
+        "You are the research assistant for an enterprise knowledge base.\n"
+        "Use SOURCE_SNIPPETS as the primary evidence. If the user needs arithmetic, "
+        "call calculator. For fixed internal KPIs not in the snippets, call internal_metric_lookup.\n"
+        "Cite which source index (Source 1, 2, …) supports key claims when possible.\n"
+        "If sources are empty or irrelevant, say so and rely on tools or careful reasoning."
     )
+    if feedback:
+        sys_content += f"\n\nCRITICAL FEEDBACK FROM PREVIOUS ATTEMPT:\n{feedback}\nPlease fix your answer based on this feedback."
+
+    sys = SystemMessage(content=sys_content)
     hist_block = f"PRIOR_SESSION_TURNS:\n{history}\n\n" if history else ""
     human = HumanMessage(
         content=(
@@ -84,6 +86,9 @@ def make_coder_node(settings: Settings) -> Callable[[MultiAgentState], MultiAgen
         history = (state.get("history_text") or "").strip()
         context = (state.get("context_text") or "").strip()
         trace = (state.get("trace") or []) + ["coder_agent"]
+        retry_count = state.get("retry_count", 0)
+        feedback_list = state.get("critic_feedback") or []
+        feedback_str = "\n".join(feedback_list) if feedback_list else ""
 
         draft = ""
 
@@ -94,7 +99,7 @@ def make_coder_node(settings: Settings) -> Callable[[MultiAgentState], MultiAgen
             backend = "Groq" if not hasattr(primary_llm, "base_url") else "Ollama"
             logger.info("coder_agent: using %s for synthesis.", backend)
 
-            messages = _build_messages(query, history, context)
+            messages = _build_messages(query, history, context, feedback_str)
             draft = _run_synthesis(primary_llm_tools, tool_by_name, messages, backend)
 
         except Exception as exc:  # noqa: BLE001
@@ -108,7 +113,7 @@ def make_coder_node(settings: Settings) -> Callable[[MultiAgentState], MultiAgen
                 try:
                     ollama_llm = get_ollama_llm(settings, temperature=0.2)
                     ollama_llm_tools = ollama_llm.bind_tools(tools)
-                    messages = _build_messages(query, history, context)  # fresh messages
+                    messages = _build_messages(query, history, context, feedback_str)  # fresh messages
                     draft = _run_synthesis(ollama_llm_tools, tool_by_name, messages, "Ollama")
                     logger.info("coder_agent: Ollama fallback succeeded.")
                 except Exception as ollama_exc:  # noqa: BLE001
@@ -132,6 +137,6 @@ def make_coder_node(settings: Settings) -> Callable[[MultiAgentState], MultiAgen
         if not draft:
             draft = "I could not produce a final answer within the step limit. Please try rephrasing."
 
-        return {"draft_answer": draft, "trace": trace}
+        return {"draft_answer": draft, "trace": trace, "retry_count": retry_count + 1}
 
     return synthesize

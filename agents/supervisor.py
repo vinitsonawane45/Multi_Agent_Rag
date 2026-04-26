@@ -34,6 +34,16 @@ def _finalize(state: MultiAgentState) -> MultiAgentState:
     return {"final_answer": body, "trace": trace}
 
 
+def make_route_after_critic(settings: Settings):
+    def route(state: MultiAgentState) -> str:
+        grounded = state.get("critic_grounded", True)
+        retry_count = state.get("retry_count", 0)
+        if not grounded and retry_count < settings.max_retries:
+            return "coder_agent"
+        return "finalize"
+    return route
+
+
 def build_graph(settings: Settings, redis_client: redis.Redis, qdrant_client: QdrantClient):
     g = StateGraph(MultiAgentState)
     g.add_node("memory_load", make_memory_load_node(redis_client, settings))
@@ -47,7 +57,13 @@ def build_graph(settings: Settings, redis_client: redis.Redis, qdrant_client: Qd
     g.add_edge("memory_load", "retriever_agent")
     g.add_edge("retriever_agent", "coder_agent")
     g.add_edge("coder_agent", "critic_agent")
-    g.add_edge("critic_agent", "finalize")
+    
+    g.add_conditional_edges(
+        "critic_agent",
+        make_route_after_critic(settings),
+        {"coder_agent": "coder_agent", "finalize": "finalize"}
+    )
+    
     g.add_edge("finalize", "memory_save")
     g.add_edge("memory_save", END)
     return g.compile()

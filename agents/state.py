@@ -19,3 +19,5 @@ class MultiAgentState(TypedDict, total=False):
     revised_answer: str
     final_answer: str
     trace: list[str]
+    retry_count: int
+    critic_feedback: list[str]

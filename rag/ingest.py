@@ -8,12 +8,12 @@ from pathlib import Path
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
-from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct
+from qdrant_client import QdrantClient, models
 
 from core.clients import make_qdrant_client
 from core.config import Settings
 from rag.retriever import ensure_collection
+from fastembed import SparseTextEmbedding
 
 
 def _embeddings(settings: Settings) -> HuggingFaceEmbeddings:
@@ -22,6 +22,9 @@ def _embeddings(settings: Settings) -> HuggingFaceEmbeddings:
         model_kwargs={"device": "cpu"},
         encode_kwargs={"normalize_embeddings": True},
     )
+
+def _sparse_embeddings(settings: Settings) -> SparseTextEmbedding:
+    return SparseTextEmbedding(model_name=settings.sparse_embedding_model)
 
 
 def _read_text(path: Path) -> str:
@@ -54,6 +57,7 @@ def ingest_paths(
         chunk_overlap=settings.chunk_overlap,
     )
     emb = _embeddings(settings)
+    sparse_emb = _sparse_embeddings(settings)
     probe = emb.embed_query("dimension probe")
     dim = len(probe)
     
@@ -67,7 +71,7 @@ def ingest_paths(
     # Ensure collection exists after potential deletion
     ensure_collection(client, settings.qdrant_collection, dim)
 
-    points: list[PointStruct] = []
+    points: list[models.PointStruct] = []
     for p in paths:
         if not p.is_file():
             continue
@@ -77,11 +81,18 @@ def ingest_paths(
         source = str(p.resolve())
         chunks = splitter.split_text(raw)
         vectors = emb.embed_documents(chunks)
-        for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
+        sparse_vectors = list(sparse_emb.embed(chunks))
+        for i, (chunk, vec, s_vec) in enumerate(zip(chunks, vectors, sparse_vectors)):
             points.append(
-                PointStruct(
+                models.PointStruct(
                     id=str(uuid.uuid4()),
-                    vector=list(vec),
+                    vector={
+                        "dense": list(vec),
+                        "sparse": models.SparseVector(
+                            indices=s_vec.indices.tolist(),
+                            values=s_vec.values.tolist(),
+                        )
+                    },
                     payload={
                         "text": chunk,
                         "source": source,

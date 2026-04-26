@@ -5,8 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models
 from qdrant_client.models import FieldCondition, Filter, MatchValue
+from fastembed import SparseTextEmbedding
 
 from core.config import Settings
 
@@ -19,12 +20,16 @@ def _embeddings(settings: Settings) -> HuggingFaceEmbeddings:
     )
 
 
+def _sparse_embeddings(settings: Settings) -> SparseTextEmbedding:
+    return SparseTextEmbedding(model_name=settings.sparse_embedding_model)
+
 def ensure_collection(client: QdrantClient, collection: str, vector_size: int) -> None:
     names = {c.name for c in client.get_collections().collections}
     if collection not in names:
         client.create_collection(
             collection_name=collection,
-            vectors_config={"size": vector_size, "distance": "Cosine"},
+            vectors_config={"dense": {"size": vector_size, "distance": "Cosine"}},
+            sparse_vectors_config={"sparse": {}},
         )
 
 
@@ -32,6 +37,10 @@ def embed_query(settings: Settings, text: str) -> list[float]:
     emb = _embeddings(settings)
     v = emb.embed_query(text)
     return list(v)
+
+def embed_query_sparse(settings: Settings, text: str):
+    sparse_emb = _sparse_embeddings(settings)
+    return list(sparse_emb.query_embed(text))[0]
 
 
 def retrieve(
@@ -43,6 +52,7 @@ def retrieve(
 ) -> list[dict[str, Any]]:
     k = top_k if top_k is not None else settings.retrieval_top_k
     vector = embed_query(settings, query)
+    sparse_vector = embed_query_sparse(settings, query)
     query_filter = None
     if source_prefix:
         query_filter = Filter(
@@ -54,11 +64,26 @@ def retrieve(
             ]
         )
     
-    # FIXED: Use query_points() instead of search()
-    # OLD: hits = client.search(...)
+    prefetch = [
+        models.Prefetch(
+            query=vector,
+            using="dense",
+            limit=k,
+        ),
+        models.Prefetch(
+            query=models.SparseVector(
+                indices=sparse_vector.indices.tolist(),
+                values=sparse_vector.values.tolist(),
+            ),
+            using="sparse",
+            limit=k,
+        )
+    ]
+    
     search_result = client.query_points(
         collection_name=settings.qdrant_collection,
-        query=vector,  # FIXED: 'query_vector' -> 'query'
+        prefetch=prefetch,
+        query=models.FusionQuery(fusion=models.Fusion.RRF),
         limit=k,
         with_payload=True,
         query_filter=query_filter,
