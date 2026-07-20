@@ -22,16 +22,58 @@ from rag.ingest import ingest_paths
 logger = logging.getLogger(__name__)
 
 
+class _InMemoryRedis:
+    """Tiny in-process Redis-like shim implementing the minimal API used by the app.
+
+    Methods: `ping()`, `lrange(key, start, end)`, `rpush(key, value)`, `close()`.
+    This keeps the app usable in dev when a real Redis server isn't available.
+    """
+
+    def __init__(self) -> None:
+        self._store: dict[str, list[str]] = {}
+
+    def ping(self) -> bool:  # pragma: no cover - simple shim
+        return True
+
+    def lrange(self, key: str, start: int, end: int) -> list[str]:
+        lst = self._store.get(key, [])
+        # Normalize negative indices similar to Redis behaviour
+        if start < 0:
+            start = max(len(lst) + start, 0)
+        if end < 0:
+            end = len(lst) + end
+        # Redis lrange end is inclusive
+        end = min(end, len(lst) - 1)
+        if start > end:
+            return []
+        return lst[start : end + 1]
+
+    def rpush(self, key: str, value: str) -> int:
+        self._store.setdefault(key, []).append(value)
+        return len(self._store[key])
+
+    def close(self) -> None:
+        self._store.clear()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     s = get_settings()
     app.state.settings = s
-    app.state.redis = redis.Redis(
-        host=s.redis_host,
-        port=s.redis_port,
-        db=s.redis_db,
-        decode_responses=True,
-    )
+    # Try to create a real Redis client; fall back to an in-memory shim if unavailable.
+    try:
+        rclient = redis.Redis(
+            host=s.redis_host,
+            port=s.redis_port,
+            db=s.redis_db,
+            decode_responses=True,
+        )
+        # Quick ping to confirm availability
+        rclient.ping()
+        app.state.redis = rclient
+    except Exception:  # noqa: BLE001 - fallback to in-memory store
+        logger.warning("Redis unreachable; using in-process memory fallback for session history.")
+        app.state.redis = _InMemoryRedis()
     app.state.qdrant = make_qdrant_client(s)
     app.state.graph = build_graph(s, app.state.redis, app.state.qdrant)
     Path("data/uploads").mkdir(parents=True, exist_ok=True)

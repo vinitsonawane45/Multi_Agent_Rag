@@ -537,6 +537,22 @@ export default function App() {
               Purge existing knowledge base
             </label>
 
+            <div
+              className="upload-dropzone"
+              onClick={() => fileRef.current?.click()}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => e.key === "Enter" && fileRef.current?.click()}
+            >
+              <div className="upload-icon">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              </div>
+              <div className="upload-copy">
+                <strong>Choose a document to ingest</strong>
+                <span>Drag or click to upload PDF, TXT, Markdown, or DOCX.</span>
+              </div>
+            </div>
+
             <input
               ref={fileRef}
               type="file"
@@ -545,22 +561,32 @@ export default function App() {
               onChange={() => void onPickFile()}
             />
 
-            <button
-              type="button"
-              className="btn ingest-btn"
-              disabled={ingesting}
-              onClick={() => fileRef.current?.click()}
-            >
-              {ingesting ? (
-                <span className="ingesting">
-                  <span className="spinner small"></span>
-                  Processing Vectors...
-                </span>
-              ) : (
-                "Upload Document"
+            <div className="upload-notice">
+              <span>Accepted file types: PDF, TXT, Markdown, DOCX</span>
+            </div>
+
+            <div className="upload-actions">
+              <button
+                type="button"
+                className="btn ingest-btn"
+                disabled={ingesting}
+                onClick={() => fileRef.current?.click()}
+              >
+                {ingesting ? (
+                  <span className="ingesting">
+                    <span className="spinner small"></span>
+                    Processing Vectors...
+                  </span>
+                ) : (
+                  "Upload Document"
+                )}
+              </button>
+              {ingestMsg && (
+                <div className={`upload-status ${ingestMsg.includes("Error") ? "error" : "success"}`}>
+                  {ingestMsg}
+                </div>
               )}
-            </button>
-            {ingestMsg && <div className={`ingest-msg ${ingestMsg.includes("Error") ? "error" : "success"}`}>{ingestMsg}</div>}
+            </div>
           </div>
 
           <div className="panel info-panel">
